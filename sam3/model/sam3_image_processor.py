@@ -10,6 +10,13 @@ from sam3.model import box_ops
 from sam3.model.data_misc import FindStage, interpolate
 from torchvision.transforms import v2
 
+# For batched inference
+from sam3.train.data.sam3_image_dataset import InferenceMetadata, FindQueryLoaded, Image as SAMImage, Datapoint
+from sam3.train.data.collator import collate_fn_api as collate
+from sam3.train.transforms.basic_for_api import ComposeAPI, RandomResizeAPI, ToTensorAPI, NormalizeAPI
+from sam3.eval.postprocessors import PostProcessImage
+from sam3.model.utils.misc import copy_data_to_device
+
 
 class Sam3Processor:
     """ """
@@ -123,6 +130,133 @@ class Sam3Processor:
             state["geometric_prompt"] = self.model._get_dummy_prompt()
 
         return self._forward_grounding(state)
+
+    @torch.inference_mode()
+    def set_text_prompts(self, prompts: List[str], state: Dict):
+        """Segments multiple text prompts at once and returns results for each.
+
+        Args:
+            prompts: List of text prompts (e.g., ["wheel", "windshield", "headlight"])
+            state: State from set_image()
+
+        Returns:
+            Dict mapping each prompt to its results:
+            {
+                "wheel": {"masks": [...], "boxes": [...], "scores": [...]},
+                "windshield": {"masks": [...], "boxes": [...], "scores": [...]},
+                ...
+            }
+        """
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before set_text_prompts")
+
+        results = {}
+        for prompt in prompts:
+            self.reset_all_prompts(state)
+            state = self.set_text_prompt(prompt=prompt, state=state)
+            # Clone tensors so they don't get overwritten by next prompt
+            results[prompt] = {
+                "masks": state.get("masks", torch.tensor([])).clone(),
+                "boxes": state.get("boxes", torch.tensor([])).clone(),
+                "scores": state.get("scores", torch.tensor([])).clone(),
+            }
+
+        # Store combined results in state for convenience
+        state["multi_prompt_results"] = results
+        return results
+
+    @torch.inference_mode()
+    def set_text_prompts_batched(self, prompts: List[str], image: PIL.Image.Image):
+        """Segments multiple text prompts in a SINGLE forward pass (faster).
+
+        Unlike set_text_prompts() which loops through prompts sequentially,
+        this method processes all prompts in one forward pass through the model.
+
+        Args:
+            prompts: List of text prompts (e.g., ["wheel", "windshield", "headlight"])
+            image: PIL Image (required - doesn't use state, processes image fresh)
+
+        Returns:
+            Dict mapping each prompt to its results:
+            {
+                "wheel": {"masks": Tensor, "boxes": Tensor, "scores": Tensor},
+                ...
+            }
+        """
+        # Setup transforms and postprocessor
+        transform = ComposeAPI(
+            transforms=[
+                RandomResizeAPI(sizes=self.resolution, max_size=self.resolution, square=True, consistent_transform=False),
+                ToTensorAPI(),
+                NormalizeAPI(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+        postprocessor = PostProcessImage(
+            max_dets_per_img=-1,
+            iou_type="segm",
+            use_original_sizes_box=True,
+            use_original_sizes_mask=True,
+            convert_mask_to_rle=False,
+            detection_threshold=self.confidence_threshold,
+            to_cpu=False,
+        )
+
+        # Create datapoint with image
+        w, h = image.size
+        datapoint = Datapoint(find_queries=[], images=[])
+        datapoint.images = [SAMImage(data=image, objects=[], size=[h, w])]
+
+        # Add all text prompts
+        prompt_ids = {}
+        for idx, prompt in enumerate(prompts):
+            datapoint.find_queries.append(
+                FindQueryLoaded(
+                    query_text=prompt,
+                    image_id=0,
+                    object_ids_output=[],
+                    is_exhaustive=True,
+                    query_processing_order=0,
+                    inference_metadata=InferenceMetadata(
+                        coco_image_id=idx,
+                        original_image_id=idx,
+                        original_category_id=1,
+                        original_size=[w, h],
+                        object_id=0,
+                        frame_index=0,
+                    )
+                )
+            )
+            prompt_ids[idx] = prompt
+
+        # Transform and collate
+        datapoint = transform(datapoint)
+        batch = collate([datapoint], dict_key="dummy")["dummy"]
+        batch = copy_data_to_device(batch, torch.device(self.device), non_blocking=True)
+
+        # Single forward pass for ALL prompts
+        output = self.model(batch)
+
+        # Postprocess results
+        processed_results = postprocessor.process_results(output, batch.find_metadatas)
+
+        # Organize results by prompt name
+        results = {}
+        for idx, prompt in prompt_ids.items():
+            if idx in processed_results:
+                res = processed_results[idx]
+                results[prompt] = {
+                    "masks": res.get("masks", torch.tensor([])),
+                    "boxes": res.get("boxes", torch.tensor([])),
+                    "scores": res.get("scores", torch.tensor([])),
+                }
+            else:
+                results[prompt] = {
+                    "masks": torch.tensor([]),
+                    "boxes": torch.tensor([]),
+                    "scores": torch.tensor([]),
+                }
+
+        return results
 
     @torch.inference_mode()
     def add_geometric_prompt(self, box: List, label: bool, state: Dict):
