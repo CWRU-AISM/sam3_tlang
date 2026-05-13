@@ -259,6 +259,87 @@ class Sam3Processor:
         return results
 
     @torch.inference_mode()
+    def set_point_prompt(self, state: Dict, point_xy, label: int = 1,
+                          multimask_output: bool = True) -> Dict:
+        """Run the interactive (point-prompted) predictor on the current image.
+
+        ``set_image`` must have been called.  Forwards to the underlying
+        ``SAM3InteractiveImagePredictor`` via ``model.predict_inst`` which
+        re-uses the already-computed backbone features in ``state``.
+
+        Args:
+          state: state dict returned by ``set_image``.
+          point_xy: ``(x, y)`` pixel coords for a foreground click (or an
+            ``Nx2`` array for multiple points).
+          label: ``1`` for foreground, ``0`` for background.  When
+            ``point_xy`` is a single point this is broadcast.
+          multimask_output: if True, returns 3 candidate masks; we keep
+            the highest-IoU one.
+
+        Returns:
+          state dict with ``masks`` (1xHxW bool), ``masks_logits``
+          (1xHxW float), ``boxes`` (Nx4 xyxy float), ``scores`` (length-N
+          float) — same shape contract as ``set_text_prompt`` so callers
+          can treat the result uniformly.
+        """
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before set_point_prompt")
+        if self.model.inst_interactive_predictor is None:
+            raise RuntimeError(
+                "This SAM3 model was loaded without an interactive predictor; "
+                "point prompts are not available.")
+
+        pts = np.asarray(point_xy, dtype=np.float32)
+        if pts.ndim == 1:
+            pts = pts[None, :]
+        if pts.shape[-1] != 2:
+            raise ValueError(f"point_xy must be (x,y) or Nx2, got {pts.shape}")
+        labels = np.full((pts.shape[0],), int(label), dtype=np.int32)
+
+        masks_np, ious_np, _ = self.model.predict_inst(
+            state,
+            point_coords=pts,
+            point_labels=labels,
+            multimask_output=multimask_output,
+            return_logits=False,
+            normalize_coords=True,
+        )
+        # masks_np: (C, H, W) float in [0,1] (already thresholded since
+        # return_logits=False — values are 0/1).  ious_np: (C,) float.
+        if masks_np.ndim == 2:
+            masks_np = masks_np[None, ...]
+            ious_np = np.asarray([float(ious_np)])
+
+        # Pick the highest-IoU mask when multimask_output=True.
+        best = int(np.argmax(ious_np)) if ious_np.size > 0 else 0
+        best_mask = masks_np[best].astype(bool)
+        best_score = float(ious_np[best]) if ious_np.size > 0 else 0.0
+
+        # Compute xyxy bbox in pixel coords on the original image.
+        H, W = best_mask.shape
+        if best_mask.any():
+            ys, xs = np.where(best_mask)
+            x0, y0 = float(xs.min()), float(ys.min())
+            x1, y1 = float(xs.max()), float(ys.max())
+        else:
+            x0 = y0 = x1 = y1 = 0.0
+
+        device = self.device
+        mask_t = torch.from_numpy(best_mask).to(device).unsqueeze(0)
+        logits_t = torch.from_numpy(masks_np[best].astype(np.float32)).to(
+            device).unsqueeze(0).unsqueeze(0)
+        box_t = torch.tensor([[x0, y0, x1, y1]], device=device,
+                              dtype=torch.float32)
+        score_t = torch.tensor([best_score], device=device,
+                                dtype=torch.float32)
+
+        state["masks"] = mask_t
+        state["masks_logits"] = logits_t
+        state["boxes"] = box_t
+        state["scores"] = score_t
+        return state
+
+    @torch.inference_mode()
     def add_geometric_prompt(self, box: List, label: bool, state: Dict):
         """Adds a box prompt and run the inference.
         The image needs to be set, but not necessarily the text prompt.
